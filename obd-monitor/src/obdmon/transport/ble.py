@@ -78,6 +78,14 @@ def pick_characteristics(services) -> tuple[object, object]:
     return rx, tx
 
 
+def choose_write_mode(modes: tuple, wanted: Optional[bool]) -> bool:
+    """True = escrita com resposta. Padrão: SEM resposta quando a característica
+    permite (economiza uma ida e volta de rádio por comando)."""
+    if wanted is not None and wanted in modes:
+        return wanted
+    return False if False in modes else True
+
+
 def describe_services(services) -> str:
     lines = []
     for s in services:
@@ -90,7 +98,11 @@ def describe_services(services) -> str:
 class BleTransport(Transport):
     name = "Bluetooth LE"
 
-    def __init__(self, address: str, connect_timeout: float = 15.0) -> None:
+    def __init__(self, address: str, connect_timeout: float = 15.0,
+                 write_with_response: Optional[bool] = None) -> None:
+        """``write_with_response``: None = automático (usa escrita SEM resposta
+        quando a característica permite: economiza uma ida e volta de rádio por
+        comando; os comandos são curtos e sempre esperamos o '>' antes do próximo)."""
         super().__init__()
         self.address = address
         self.connect_timeout = connect_timeout
@@ -98,7 +110,10 @@ class BleTransport(Transport):
         self._rx = None
         self._tx = None
         self._with_response = False
+        self._wanted_response = write_with_response
         self._connected = False
+        self._link_info: dict = {}
+        self._conn_req = None
 
     async def connect(self) -> None:
         from bleak import BleakClient
@@ -124,7 +139,8 @@ class BleTransport(Transport):
             raise TransportError("Não achei as características de comunicação do adaptador.\n"
                                  "Serviços encontrados:\n" + desc)
         self._client, self._rx, self._tx = client, rx, tx
-        self._with_response = "write" in tx.properties
+        modes = self.write_modes
+        self._with_response = choose_write_mode(modes, self._wanted_response)
         try:
             await client.start_notify(rx, lambda _h, data: self._emit_data(bytes(data)))
         except Exception as e:
@@ -134,7 +150,58 @@ class BleTransport(Transport):
                 pass
             raise TransportError(f"Falha ao ativar notificações: {e}") from e
         self._connected = True
-        log.info("BLE conectado: rx=%s tx=%s response=%s", rx.uuid, tx.uuid, self._with_response)
+        self._link_info = self._tune_link(client)
+        log.info("BLE conectado: rx=%s tx=%s escrita_com_resposta=%s modos=%s %s", rx.uuid, tx.uuid,
+                 self._with_response, ",".join("com" if m else "sem" for m in modes),
+                 " ".join(f"{k}={v}" for k, v in self._link_info.items()))
+
+    def _tune_link(self, client) -> dict:
+        """Melhor esforço, só no Windows 11: pede ao Windows parâmetros de conexão
+        "ThroughputOptimized" (intervalo de conexão curto) e lê o intervalo
+        atual. O Windows/adaptador podem recusar; nada aqui é obrigatório.
+        O pedido só vale enquanto o objeto existir: fica guardado em _conn_req."""
+        info: dict = {}
+        try:
+            info["mtu"] = int(client.mtu_size)
+        except Exception:
+            pass
+        dev = getattr(getattr(client, "_backend", None), "_requester", None)
+        if dev is None:
+            return info
+        try:
+            from winrt.windows.devices.bluetooth import BluetoothLEPreferredConnectionParameters as P
+            req = dev.request_preferred_connection_parameters(P.throughput_optimized)
+            self._conn_req = req
+            info["pedido_intervalo_curto"] = str(getattr(req, "status", "enviado")).split(".")[-1]
+        except Exception as e:  # Windows 10 / API ausente
+            info["pedido_intervalo_curto"] = f"indisponível ({type(e).__name__})"
+        try:
+            cp = dev.get_connection_parameters()
+            info["intervalo_conexao_ms"] = round(cp.connection_interval * 1.25, 2)
+            info["latencia_escravo"] = cp.connection_latency
+            info["supervisao_ms"] = cp.link_timeout * 10
+        except Exception:
+            pass
+        return info
+
+    @property
+    def write_modes(self) -> tuple[bool, ...]:
+        if self._tx is None:
+            return ()
+        props = self._tx.properties
+        return tuple(m for m, p in ((True, "write"), (False, "write-without-response")) if p in props)
+
+    @property
+    def write_with_response(self) -> Optional[bool]:
+        return self._with_response if self._tx is not None else None
+
+    def set_write_with_response(self, with_response: bool) -> bool:
+        if with_response not in self.write_modes:
+            return False
+        self._with_response = with_response
+        self._wanted_response = with_response
+        log.info("BLE: escrita %s resposta", "com" if with_response else "sem")
+        return True
 
     async def write(self, data: bytes) -> None:
         safety.check_raw_bytes(data)  # última barreira: somente leitura
@@ -148,6 +215,12 @@ class BleTransport(Transport):
     async def disconnect(self) -> None:
         c, self._client = self._client, None
         self._connected = False
+        req, self._conn_req = self._conn_req, None
+        if req is not None:
+            try:
+                req.close()
+            except Exception:
+                pass
         if c is not None:
             try:
                 await asyncio.wait_for(c.disconnect(), 5.0)
@@ -164,4 +237,13 @@ class BleTransport(Transport):
             d["caracteristica_rx"] = self._rx.uuid
             d["caracteristica_tx"] = self._tx.uuid
             d["escrita_com_resposta"] = "sim" if self._with_response else "não"
+            d["modos_de_escrita"] = ", ".join("com resposta" if m else "sem resposta" for m in self.write_modes)
+        for k, v in self._link_info.items():
+            d[k] = v
+        if self._client is not None and "intervalo_conexao_ms" in self._link_info:
+            try:   # o Windows pode ter mudado o intervalo depois do pedido
+                dev = self._client._backend._requester
+                d["intervalo_conexao_ms"] = round(dev.get_connection_parameters().connection_interval * 1.25, 2)
+            except Exception:
+                pass
         return d

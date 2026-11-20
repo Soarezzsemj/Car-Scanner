@@ -67,6 +67,7 @@ class _Base(QWidget):
         self.target: Optional[float] = None
         self.shown: Optional[float] = None
         self.supported = True
+        self.stale = False          # dado com mais de 1,5 s: valor em amarelo
         self.trip_min: Optional[float] = None
         self.trip_max: Optional[float] = None
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
@@ -91,6 +92,16 @@ class _Base(QWidget):
         if ok != self.supported:
             self.supported = ok
             self.update()
+
+    def set_stale(self, stale: bool) -> None:
+        if stale != self.stale:
+            self.stale = stale
+            self.update()
+
+    def value_color(self) -> QColor:
+        if self.target is None:
+            return QColor(theme.DIM)
+        return QColor(theme.YELLOW if self.stale else theme.TEXT)
 
     def reset_trip(self) -> None:
         self.trip_min = self.trip_max = None
@@ -294,7 +305,7 @@ class ArcGauge(_Base):
             p.drawText(QRectF(cx - r, cy + r * 0.05, 2 * r, r * 0.55), Qt.AlignmentFlag.AlignCenter,
                        "não suportado\npelo carro")
         else:
-            p.setPen(QColor(theme.TEXT) if v is not None else QColor(theme.DIM))
+            p.setPen(self.value_color() if v is not None else QColor(theme.DIM))
             p.setFont(theme.font(max(UNIT_MIN_PX, int(r * (0.36 if self.big else 0.33))), QFont.Weight.Bold))
             p.drawText(QRectF(cx - r, cy + r * 0.08, 2 * r, r * (UNIT_TOP - 0.08)), Qt.AlignmentFlag.AlignCenter,
                        self.text(self.target if self.target is not None else None))
@@ -343,7 +354,7 @@ class BarGauge(_Base):
         p.drawText(QRectF(pad, 8, w - 2 * pad, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title)
         if self.supported:
             txt = self.text(self.target) + (f" {self.unit}" if self.target is not None else "")
-            p.setPen(QColor(theme.TEXT) if self.target is not None else QColor(theme.DIM))
+            p.setPen(self.value_color())
             p.setFont(theme.font(22, QFont.Weight.Bold))
         else:
             txt = "não suportado"

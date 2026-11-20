@@ -39,7 +39,9 @@ class DiagnosticsPage(QWidget):
         names = [("transporte", "Transporte"), ("endereco", "Endereço"), ("versao", "Versão do ELM"),
                  ("protocolo", "Protocolo"), ("tensao", "Tensão (ATRV)"), ("hz", "Ciclo rápido"),
                  ("ciclo", "Duração do ciclo"), ("dtc", "Leitura de DTC"), ("conexoes", "Conexões"),
-                 ("erro", "Último erro")]
+                 ("erro", "Último erro"), ("modo", "Modo de leitura"), ("hz_medio", "Média da viagem"),
+                 ("lat1", "Latência (1 PID)"), ("latm", "Latência (multi-PID)"),
+                 ("link", "Link BLE (Windows)"), ("desativadas", "Otimizações desligadas")]
         for i, (k, label) in enumerate(names):
             r, c = divmod(i, 2)
             lbl = QLabel(label)
@@ -56,9 +58,9 @@ class DiagnosticsPage(QWidget):
 
         split = QSplitter(Qt.Orientation.Vertical)
         lay.addWidget(split, 1)
-        self.table = QTableWidget(len(PIDS), 9)
-        self.table.setHorizontalHeaderLabels(["PID", "Nome", "Suporte", "Ciclo", "Média (ms)", "Mín", "Máx",
-                                              "OK", "Falhas"])
+        self.table = QTableWidget(len(PIDS), 11)
+        self.table.setHorizontalHeaderLabels(["PID", "Nome", "Suporte", "Ciclo", "Taxa (Hz)", "Idade (s)",
+                                              "Média (ms)", "Mín", "Máx", "OK", "Falhas"])
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -97,6 +99,9 @@ class DiagnosticsPage(QWidget):
     def set_report(self, text: str) -> None:
         self.report.setPlainText(text)
 
+    def add_notice(self, msg: str) -> None:
+        self.report.appendPlainText(f"[{datetime.now():%H:%M:%S}] {msg}")
+
     def set_running(self, running: bool) -> None:
         self.run_btn.setEnabled(not running)
         self.run_btn.setText("Autoteste em andamento..." if running else "▶ Rodar autoteste")
@@ -123,6 +128,21 @@ class DiagnosticsPage(QWidget):
         f["dtc"].setText("--" if dm is None else f"{dm:.0f} ms (03/07 a cada 5 s, 0A a cada 60 s)")
         f["conexoes"].setText(str(d.get("conexoes", 0)))
         f["erro"].setText(d.get("erro") or "nenhum")
+        f["modo"].setText(f"{d.get('otimizacoes', '--')}  [{d.get('origem_otimizacoes', '')}]")
+        f["hz_medio"].setText(f"{d.get('hz_medio') or 0:.2f} rodadas completas/s".replace(".", ","))
+
+        def lat(r):
+            if r is None or not r.n:
+                return "--"
+            return (f"{r.total:.0f} ms = escrita {r.write:.0f} + até o 1º byte {r.first:.0f} + "
+                    f"espera do '>' {r.wait:.0f} (máx {r.max_total:.0f})")
+        f["lat1"].setText(lat(d.get("req_1")))
+        f["latm"].setText(lat(d.get("req_multi")))
+        keys = (("intervalo_conexao_ms", "intervalo {} ms"), ("mtu", "MTU {}"),
+                ("escrita_com_resposta", "escrita com resposta: {}"), ("pedido_intervalo_curto", "pedido curto: {}"))
+        f["link"].setText(" · ".join(fmt.format(tr[k]) for k, fmt in keys if k in tr) or "--")
+        dis = d.get("desativadas") or {}
+        f["desativadas"].setText("; ".join(f"{k}: {v}" for k, v in dis.items()) or "nenhuma")
         stats = d.get("stats", {})
         sup = d.get("suportados")
         for row, p in enumerate(PIDS):
@@ -138,8 +158,11 @@ class DiagnosticsPage(QWidget):
             else:
                 s, col = "? (máscara não lida)" if sup is None else "?", theme.MUTED
             cycle = {"rapido": "rápido", "medio": "médio (2 s)", "lento": "lento (30 s)"}.get(st.cycle, st.cycle)
-            cells = [p.hex, p.name, s, cycle, _ms(st.lat_avg), _ms(st.lat_min), _ms(st.lat_max),
-                     str(st.ok), str(st.fails)]
+            hz = (d.get("hz_pid") or {}).get(p.pid)
+            age = (d.get("idade_pid") or {}).get(p.pid)
+            cells = [p.hex, p.name, s, cycle, "--" if not hz else f"{hz:.1f}".replace(".", ","),
+                     "--" if age is None else f"{age:.1f}".replace(".", ","),
+                     _ms(st.lat_avg), _ms(st.lat_min), _ms(st.lat_max), str(st.ok), str(st.fails)]
             for c, txt in enumerate(cells):
                 it = self.table.item(row, c)
                 if it is None:
@@ -148,16 +171,18 @@ class DiagnosticsPage(QWidget):
                 it.setText(txt)
                 if c == 2:
                     it.setForeground(QColor(col))
+                if c == 5:
+                    it.setForeground(QColor(theme.YELLOW if age is not None and age > 1.5 else theme.TEXT))
 
     def report_text(self) -> str:
         lines = [f"RELATÓRIO DO ADAPTADOR – {datetime.now():%d/%m/%Y %H:%M:%S}", ""]
         for k, lbl in self.fields.items():
             lines.append(f"{k}: {lbl.text()}")
-        lines += ["", "PID  Nome                       Suporte              Ciclo            média  mín  máx  ok  falhas"]
+        lines += ["", "PID  Nome                       Suporte              Ciclo              Hz  idade  média  mín  máx  ok  falhas"]
         for r in range(self.table.rowCount()):
-            cells = [(self.table.item(r, c).text() if self.table.item(r, c) else "") for c in range(9)]
-            lines.append(f"{cells[0]:<4} {cells[1]:<26} {cells[2]:<20} {cells[3]:<16} {cells[4]:>5} {cells[5]:>4} "
-                         f"{cells[6]:>4} {cells[7]:>4} {cells[8]:>5}")
+            cells = [(self.table.item(r, c).text() if self.table.item(r, c) else "") for c in range(11)]
+            lines.append(f"{cells[0]:<4} {cells[1]:<26} {cells[2]:<20} {cells[3]:<16} {cells[4]:>5} {cells[5]:>5} "
+                         f"{cells[6]:>5} {cells[7]:>4} {cells[8]:>4} {cells[9]:>4} {cells[10]:>5}")
         if self.report.toPlainText().strip():
             lines += ["", self.report.toPlainText()]
         return "\n".join(lines) + "\n"

@@ -22,10 +22,12 @@ def _spin(lo, hi, step, dec, suffix):
 class SettingsPage(QWidget):
     saved = Signal()
     scan_requested = Signal()
+    benchmark_requested = Signal()
 
-    def __init__(self, cfg: Config, parent=None) -> None:
+    def __init__(self, cfg: Config, parent=None, adapter_key=lambda: "") -> None:
         super().__init__(parent)
         self.cfg = cfg
+        self.adapter_key = adapter_key
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -98,6 +100,27 @@ class SettingsPage(QWidget):
         self.last.setObjectName("muted")
         f.addRow("Último usado", self.last)
 
+        f = section("VELOCIDADE DE LEITURA")
+        self.optimize = QCheckBox("Usar otimizações (sufixo \"1\", multi-PID, protocolo fixo...) com detecção automática")
+        self.optimize.setToolTip("Desmarque para usar o modo seguro (um PID por vez, como antes). "
+                                 "Vale a partir da próxima conexão.")
+        f.addRow("Otimizações", self.optimize)
+        self.tuning_lbl = QLabel()
+        self.tuning_lbl.setObjectName("muted")
+        self.tuning_lbl.setWordWrap(True)
+        f.addRow("Benchmark salvo", self.tuning_lbl)
+        brow = QHBoxLayout()
+        self.bench_btn = QPushButton("▶ Refazer benchmark (carro PARADO, motor ligado)")
+        self.bench_btn.setToolTip("Testa as combinações por ~15 s cada (2 a 3 minutos) e salva a mais rápida "
+                                  "sem erros para este adaptador.")
+        self.bench_btn.clicked.connect(self.benchmark_requested.emit)
+        self.forget_btn = QPushButton("Esquecer benchmark deste adaptador")
+        self.forget_btn.clicked.connect(self._forget_tuning)
+        brow.addWidget(self.bench_btn)
+        brow.addWidget(self.forget_btn)
+        brow.addStretch(1)
+        f.addRow("", brow)
+
         lay.addSpacing(14)
         btns = QHBoxLayout()
         btns.addStretch(1)
@@ -129,6 +152,31 @@ class SettingsPage(QWidget):
         self.unit.setCurrentIndex(1 if c.temp_unit == "F" else 0)
         self.addr.setText(c.preferred_address)
         self.last.setText(f"{c.last_name or '-'}  {c.last_address}")
+        self.optimize.setChecked(c.optimize)
+        key = self.adapter_key()
+        t = c.tuning_for(key)
+        if not t:
+            self.tuning_lbl.setText(f"nenhum para {key or 'este adaptador'} – usando detecção automática "
+                                    "(rode o benchmark com o carro parado para escolher a melhor combinação)")
+        else:
+            from ..elm import Tuning
+            rs, safe = t.get("rodadas_s"), t.get("rodadas_s_modo_seguro")
+            gain = ""
+            if rs and safe:
+                gain = f" — de {safe:.1f} para {rs:.1f} rodadas/s".replace(".", ",")
+            self.tuning_lbl.setText(f"{key}: {Tuning.from_dict(t).describe()} (em {t.get('benchmark_em', '?')}){gain}")
+
+    def set_benchmark_running(self, running: bool) -> None:
+        self.bench_btn.setEnabled(not running)
+        self.bench_btn.setText("Benchmark em andamento..." if running
+                               else "▶ Refazer benchmark (carro PARADO, motor ligado)")
+
+    def _forget_tuning(self) -> None:
+        key = self.adapter_key()
+        self.cfg.set_tuning(key, None)
+        self.cfg.save()
+        self.load()
+        self.status.setText("Benchmark esquecido: na próxima conexão volta a detecção automática.")
 
     def _defaults(self) -> None:
         d = Config()
@@ -156,6 +204,7 @@ class SettingsPage(QWidget):
         c.sound = self.sound.isChecked()
         c.temp_unit = "F" if self.unit.currentIndex() == 1 else "C"
         c.preferred_address = self.addr.text().strip()
+        c.optimize = self.optimize.isChecked()
         c.save()
         self.status.setText("Configurações salvas ✔")
         self.saved.emit()

@@ -50,6 +50,30 @@ VALUE_KEYS: tuple[str, ...] = (
     "acelerador_pct", "admissao_c", "tensao_v", "ambiente_c",
 )
 
+# Os 5 parâmetros que ficam SEMPRE no ciclo rápido (ordem de prioridade).
+FAST_CORE: tuple[int, ...] = (0x0C, 0x0D, 0x05, 0x04, 0x11)
+FAST_CORE_KEYS: tuple[str, ...] = ("rpm", "velocidade_kmh", "arrefecimento_c", "carga_pct", "acelerador_pct")
+
+# Faixa física plausível de cada valor decodificado. Fora dela = dado errado
+# (resposta trocada/desalinhada): a otimização que gerou o valor é desligada.
+PHYS_RANGE: dict[int, tuple[float, float]] = {
+    0x0C: (0.0, 9000.0),     # RPM (o C3 corta bem antes)
+    0x0D: (0.0, 250.0),      # km/h
+    0x05: (-40.0, 160.0),    # °C
+    0x04: (0.0, 100.0),
+    0x11: (0.0, 100.0),
+    0x5C: (-40.0, 180.0),
+    0x0F: (-40.0, 120.0),
+    0x42: (0.0, 20.0),
+    0x46: (-40.0, 70.0),
+}
+
+
+def plausible(pid: int, value: float) -> bool:
+    lo, hi = PHYS_RANGE.get(pid, (float("-inf"), float("inf")))
+    return lo <= value <= hi
+
+
 # PIDs de máscara de suporte: 00 -> 01..20, 20 -> 21..40, 40 -> 41..60, 60 -> 61..80
 SUPPORT_PIDS = (0x00, 0x20, 0x40, 0x60)
 

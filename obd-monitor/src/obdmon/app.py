@@ -4,6 +4,8 @@
     python -m obdmon --sim                simulador (cenário "normal")
     python -m obdmon --sim --cenario superaquecimento --fator 10
     python -m obdmon --selftest           autoteste no console (carro parado, motor ligado)
+    python -m obdmon --benchmark          benchmark de velocidade (carro parado, motor ligado)
+    python -m obdmon --sim --perfil-adaptador clone_ruim
     python -m obdmon --endereco AA:BB:CC:DD:EE:FF
 """
 from __future__ import annotations
@@ -30,12 +32,18 @@ def _setup_logging(logs: Path) -> None:
 
 
 def parse_args(argv=None):
+    from .sim.fake_elm import PROFILES
     from .sim.scenarios import SCENARIOS
     ap = argparse.ArgumentParser(prog="obdmon", description="Monitor OBD2 (ELM327 Bluetooth LE) – somente leitura")
     ap.add_argument("--sim", action="store_true", help="usar o simulador de carro (sem hardware)")
     ap.add_argument("--cenario", default=None, choices=sorted(SCENARIOS), help="cenário do simulador")
     ap.add_argument("--fator", type=float, default=None, help="fator de tempo do simulador (1, 5, 10...)")
+    ap.add_argument("--perfil-adaptador", default="bom", choices=PROFILES,
+                    help="comportamento do ELM327 simulado (ex.: clone_ruim)")
     ap.add_argument("--selftest", action="store_true", help="autoteste no console e sai")
+    ap.add_argument("--benchmark", action="store_true",
+                    help="benchmark de velocidade no console (carro parado, motor ligado) e sai")
+    ap.add_argument("--benchmark-s", type=float, default=15.0, help="segundos por combinação no benchmark")
     ap.add_argument("--endereco", default="", help="endereço Bluetooth do adaptador")
     ap.add_argument("--listar", action="store_true", help="procura adaptadores BLE e sai")
     ap.add_argument("--auto-sair", type=float, default=0, help=argparse.SUPPRESS)  # testes: fecha após N s
@@ -94,6 +102,35 @@ def run_selftest_cli(args, cfg: Config) -> int:
     return asyncio.run(go())
 
 
+def run_benchmark_cli(args, cfg: Config) -> int:
+    from .benchmark import run_cli
+
+    async def go() -> int:
+        if args.sim:
+            from .sim.car_model import Segment
+            from .sim.fake_elm import SimAdapter, SimCar
+            from .transport.simulated import SimulatedTransport
+            prof = args.perfil_adaptador
+            car = SimCar(args.cenario or "normal", time_factor=args.fator or 1.0)
+            car.model.plan, car.model.loop_plan = [Segment("lenta", 1e9)], False   # parado, motor ligado
+            t = SimulatedTransport(SimAdapter(car, profile=prof))
+            key = f"simulador:{prof}"
+        else:
+            from .transport.ble import BleTransport
+            addr = await _pick_address_cli(cfg, args.endereco)
+            if not addr:
+                return 2
+            t = BleTransport(addr)
+            key = addr
+        try:
+            return await run_cli(t, cfg, key, args.sim, seconds=args.benchmark_s)
+        except Exception as e:
+            print(f"\nFalha no benchmark: {e}")
+            logging.getLogger(__name__).exception("benchmark")
+            return 1
+    return asyncio.run(go())
+
+
 def run_list_cli() -> int:
     from .transport.ble import scan_adapters
     devs = asyncio.run(scan_adapters(8.0))
@@ -122,7 +159,8 @@ def run_gui(args, cfg: Config) -> int:
     app.setWindowIcon(theme.make_icon())
     runner = AsyncRunner()
     scen = args.cenario or cfg.sim_scenario or "normal"
-    w = MainWindow(cfg, runner, simulated=args.sim, scenario=scen, factor=args.fator, address=args.endereco)
+    w = MainWindow(cfg, runner, simulated=args.sim, scenario=scen, factor=args.fator, address=args.endereco,
+                   profile=args.perfil_adaptador)
     w.showMaximized()
     if args.auto_sair:
         from PySide6.QtCore import QTimer
@@ -144,6 +182,8 @@ def main(argv=None) -> int:
         return run_list_cli()
     if args.selftest:
         return run_selftest_cli(args, cfg)
+    if args.benchmark:
+        return run_benchmark_cli(args, cfg)
     return run_gui(args, cfg)
 
 

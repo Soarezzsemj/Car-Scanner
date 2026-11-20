@@ -5,6 +5,8 @@ rem  Uso:  iniciar.bat                 carro real (Bluetooth LE)
 rem        iniciar.bat --sim           simulador, sem carro
 rem        iniciar.bat --sim --cenario superaquecimento --fator 10
 rem        iniciar.bat --selftest      autoteste no carro parado
+rem        iniciar.bat --benchmark     benchmark de velocidade (carro PARADO, motor ligado)
+rem        iniciar.bat --benchmark --sim   benchmark no simulador
 rem ============================================================
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul

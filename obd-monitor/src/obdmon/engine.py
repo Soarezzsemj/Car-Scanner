@@ -14,11 +14,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from datetime import timedelta
+
 from . import events as ev
 from .config import Config
+from .elm import Tuning
 from .events import AlertDetector, Event
-from .logger import TripLogger
-from .pids import BY_KEY, FAST, MEDIUM, SLOW, VALUE_KEYS
+from .logger import AGE_KEYS, TripLogger, fmt_value
+from .pids import BY_KEY, BY_PID, FAST, MEDIUM, SLOW, VALUE_KEYS
 from .poller import (ST_CONNECTED, ST_CONNECTING, ST_INIT, ST_RECONNECT_WAIT, ST_SELFTEST,
                      ST_STOPPED, ST_WAIT_ECU, WATCHDOG_WARN_S, Poller)
 from .transport.base import Transport
@@ -26,6 +29,9 @@ from .transport.base import Transport
 log = logging.getLogger(__name__)
 
 MAX_AGE = {FAST: 1.5, "rebaixado": 3.0, MEDIUM: 6.0, SLOW: 90.0}
+# Na TELA um valor rápido continua visível (em amarelo) até 5 s; no CSV some depois de 1,5 s.
+DISPLAY_MAX_AGE = {FAST: 5.0, "rebaixado": 6.0, MEDIUM: 8.0, SLOW: 90.0}
+STALE_S = 1.5   # idade acima disso = amarelo na GUI
 
 Listener = Callable[[str, Any], None]
 
@@ -42,7 +48,7 @@ class Engine:
                  simulated: bool = False, sim_car=None, sim_adapter=None,
                  logs_dir: Optional[Path] = None, listener: Optional[Listener] = None,
                  search_timeout: float = 12.0, backoff: Optional[tuple] = None,
-                 fsync: bool = True) -> None:
+                 fsync: bool = True, adapter_key: str = "") -> None:
         self.cfg = cfg
         self.simulated = simulated
         self.sim_car = sim_car
@@ -50,13 +56,18 @@ class Engine:
         self.listener = listener or (lambda k, p: None)
         self.logs_dir = Path(logs_dir) if logs_dir else cfg.logs_path
         self.fsync = fsync
+        self.adapter_key = adapter_key
         kw = {}
         if backoff:
             kw["backoff"] = backoff
+        saved = cfg.tuning_for(adapter_key)
+        tuning = Tuning.from_dict(saved) if saved else Tuning(source="padrao")
         self.poller = Poller(transport_factory, budget=cfg.log_interval,
                              on_event=self._on_poller_event, on_status=self._on_status,
                              on_dtc=lambda t: self._emit("dtc", t), on_values=self._on_values,
-                             search_timeout=search_timeout, **kw)
+                             on_reading=self._on_reading, on_notice=lambda m: self._emit("notice", m),
+                             search_timeout=search_timeout, tuning=tuning, optimize=cfg.optimize, **kw)
+        self.benchmark_running = False
         self.alerts = AlertDetector(cfg)
         self.logger: Optional[TripLogger] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -83,7 +94,7 @@ class Engine:
             log.exception("listener falhou (%s)", kind)
 
     def _on_poller_event(self, code: str, detail: str) -> None:
-        self._pending.append((code, detail, False))
+        self._pending.append((code, detail, False, None))
 
     def _on_status(self, st: str, detail: str) -> None:
         self._emit("status", (st, detail))
@@ -92,15 +103,32 @@ class Engine:
         now = time.monotonic()
         if now - self._last_live >= 0.1:
             self._last_live = now
-            self._emit("live", self.current_values())
+            self._emit("live", {"values": self.display_values(), "ages": self.ages()})
+
+    def wall_of(self, mono: float) -> datetime:
+        """Converte time.monotonic() em data/hora, ancorado no início da viagem
+        (não pula se o relógio do Windows for acertado no meio da viagem)."""
+        if self.start_wall is None:
+            return datetime.now() - timedelta(seconds=time.monotonic() - mono)
+        return self.start_wall + timedelta(seconds=mono - self.t0)
+
+    def _on_reading(self, pid: int, value: float, t_mono: float, latency: float) -> None:
+        if self.logger is None:
+            return
+        d = BY_PID[pid]
+        self.logger.log_reading(self.wall_of(t_mono), d.hex, d.name, fmt_value(d.key, value), latency * 1000)
 
     # -- API pública (thread do asyncio) ---------------------------------------
-    def mark_oil_light(self, note: str = "") -> bool:
+    def mark_oil_light(self, note: str = "", at: Optional[float] = None) -> bool:
+        """``at``: time.monotonic() do aperto da tecla/botão (a GUI captura na hora)."""
         now = time.monotonic()
-        if now - self._last_mark < 1.0:
+        at = now if at is None else min(at, now)
+        if at - self._last_mark < 1.0:
             return False  # tecla repetida / duplo clique
-        self._last_mark = now
-        self._pending.append((ev.LUZ_OLEO_MANUAL, note, True))
+        self._last_mark = at
+        self._pending.append((ev.LUZ_OLEO_MANUAL, note, True, at))
+        if self.logger is not None:
+            self.logger.log_reading(self.wall_of(at), "S", "LUZ_OLEO_MANUAL (tecla S)", "", None)
         return True
 
     def add_note(self, note: str) -> None:
@@ -120,6 +148,25 @@ class Engine:
         if self.poller.status not in (ST_CONNECTED, ST_SELFTEST):
             return {k: None for k in VALUE_KEYS}
         return {k: self.poller.current(k, self._max_age(k)) for k in VALUE_KEYS}
+
+    def display_values(self) -> dict:
+        """Valores para a TELA: um valor rápido fica visível (amarelo) até 5 s."""
+        if self.poller.status not in (ST_CONNECTED, ST_SELFTEST):
+            return {k: None for k in VALUE_KEYS}
+        out = {}
+        for k in VALUE_KEYS:
+            d = BY_KEY[k]
+            lim = DISPLAY_MAX_AGE["rebaixado" if d.pid in self.poller.demoted else d.cycle]
+            out[k] = self.poller.current(k, lim)
+        return out
+
+    def ages(self) -> dict:
+        """Idade (s) do último valor válido de cada parâmetro (None = nunca leu)."""
+        return {k: self.poller.value_age(k) for k in VALUE_KEYS}
+
+    def hz_by_key(self) -> dict:
+        now = time.monotonic()
+        return {d.key: self.poller.stats[d.pid].hz(now) for d in BY_KEY.values()}
 
     def link_state(self) -> str:
         st = self.poller.status
@@ -161,12 +208,12 @@ class Engine:
             raise
         self._emit("trip", {"csv": str(self.logger.csv_path), "dir": str(self.logs_dir),
                             "start": self.start_wall, "simulated": self.simulated})
-        self._pending.insert(0, (ev.INICIO_VIAGEM, "simulador" if self.simulated else "", False))
+        self._pending.insert(0, (ev.INICIO_VIAGEM, "simulador" if self.simulated else "", False, None))
         poll_task = asyncio.create_task(self.poller.run(), name="poller")
         try:
             await self._tick_loop(poll_task)
         finally:
-            self._pending.append((ev.FIM_VIAGEM, "", False))
+            self._pending.append((ev.FIM_VIAGEM, "", False, None))
             self._tick(final=True)
             self.poller.stop()
             try:
@@ -175,12 +222,40 @@ class Engine:
                 poll_task.cancel()
             if self.sim_adapter is not None:
                 self.sim_adapter.stop()
-            extra = {"Conexões": self.poller.connections,
-                     "Taxa média do ciclo rápido": f"{self.poller.hz:.1f} Hz".replace(".", ",")}
+            extra = self.summary_extra()
             await asyncio.get_running_loop().run_in_executor(None, self.logger.close, extra)
             self.running = False
             self._emit("stopped", {"summary": str(self.logger.summary_path), "csv": str(self.logger.csv_path)})
             self.finished.set()
+
+    def summary_extra(self) -> dict:
+        """Linhas extras do resumo. A taxa é a MÉDIA da viagem (rodadas completas
+        / tempo lendo), não a janela dos últimos 5 s (antes o resumo mostrava só
+        o fim da viagem, quando o motor já estava desligado)."""
+        p = self.poller
+
+        def br(x, d=1):
+            return f"{x:.{d}f}".replace(".", ",")
+        per = []
+        if p.poll_time_total > 0:
+            for pid in p.fast:
+                st = p.stats[pid]
+                per.append(f"{BY_PID[pid].name} {br(st.ok / p.poll_time_total)} Hz")
+        extra = {"Conexões": p.connections,
+                 "Rodadas rápidas completas por segundo (média da viagem)": br(p.avg_hz, 2),
+                 "Rodadas por segundo nos últimos 5 s (no fim da viagem)": br(p.hz),
+                 "Taxa média por parâmetro": ", ".join(per) or "--",
+                 "Modo de leitura": p.active.describe() + f" (origem: {p.active.source})"}
+        r1, rm = p.req_single, p.req_multi
+        if r1.n:
+            extra["Latência média (1 PID)"] = (f"{r1.total:.0f} ms = escrita {r1.write:.0f} + até o 1º byte "
+                                               f"{r1.first:.0f} + espera do '>' {r1.wait:.0f} (máx {r1.max_total:.0f})")
+        if rm.n:
+            extra["Latência média (multi-PID)"] = (f"{rm.total:.0f} ms = escrita {rm.write:.0f} + até o 1º byte "
+                                                   f"{rm.first:.0f} + espera do '>' {rm.wait:.0f} (máx {rm.max_total:.0f})")
+        if p.disabled:
+            extra["Otimizações desativadas"] = "; ".join(f"{k}: {v}" for k, v in p.disabled.items())
+        return extra
 
     async def _tick_loop(self, poll_task: asyncio.Task) -> None:
         interval = self.cfg.log_interval
@@ -203,25 +278,33 @@ class Engine:
 
     def _tick(self, final: bool = False) -> None:
         mono = time.monotonic()
-        wall = datetime.now()
+        wall = self.wall_of(mono)     # mesmo relógio das leituras (leituras_*.csv) e da tecla S
         t_s = mono - self.t0
         values = self.current_values()
+        ages = self.ages()
         events: list[Event] = []
         pending, self._pending = self._pending, []
-        for code, detail, crit in pending:
-            events.append(Event(code, wall, t_s, detail, crit, dict(values)))
+        notes = list(self._notes)
+        self._notes.clear()
+        for code, detail, crit, at in pending:
+            if at is not None:   # instante exato (tecla S), não o do tique
+                e = Event(code, self.wall_of(at), at - self.t0, detail, crit, dict(values))
+            else:
+                e = Event(code, wall, t_s, detail, crit, dict(values))
+            events.append(e)
         if not final:
             for code, detail, crit in self.alerts.check(values):
                 events.append(Event(code, wall, t_s, detail, crit, dict(values)))
-        notes = list(self._notes)
-        self._notes.clear()
         for e in events:
-            if e.kind == ev.LUZ_OLEO_MANUAL and e.detail:
-                notes.append(e.detail)
+            if e.kind == ev.LUZ_OLEO_MANUAL:
+                if e.detail:
+                    notes.append(e.detail)
+                notes.append(f"tecla S às {e.t_wall:%H:%M:%S}.{e.t_wall.microsecond // 1000:03d}")
         if self.poller.status == ST_SELFTEST:
-            notes.append("AUTOTESTE")
+            notes.append("BENCHMARK" if self.benchmark_running else "AUTOTESTE")
         row = {
             "t_wall": wall, "t_s": t_s, "values": values,
+            "ages": {k: (None if ages.get(k) is None else ages[k] * 1000) for k in AGE_KEYS},
             "dtcs": self.poller.active_codes(),
             "events": [e.code for e in events], "note": " / ".join(notes),
         }
@@ -241,6 +324,8 @@ class Engine:
             "age": self.poller.data_age, "lost_for": lost_for, "hz": self.poller.hz,
             "latency_ms": self.avg_latency_ms(), "alerts": dict(self.alerts.active),
             "unsupported": self.unsupported_keys(), "attempt": self.poller.reconnect_attempt,
+            "display": self.display_values(), "ages": ages, "hz_by_key": self.hz_by_key(),
+            "avg_hz": self.poller.avg_hz,
         })
         if mono - self._last_diag > 2.0 or final:
             self._last_diag = mono
@@ -267,6 +352,35 @@ class Engine:
         finally:
             self.selftest_running = False
 
+    async def run_benchmark(self, progress: Callable[[str], None] = lambda s: None,
+                            seconds: Optional[float] = None):
+        """Refaz o benchmark com o monitor rodando (carro parado, motor ligado).
+        A leitura pausa durante o teste (o CSV continua, com nota BENCHMARK)."""
+        from . import benchmark as bm
+        if self.selftest_running or self.benchmark_running:
+            return None
+        self.benchmark_running = True
+        try:
+            if not await self.poller.pause(status="Benchmark de velocidade em andamento"):
+                return "Benchmark indisponível: é preciso estar conectado ao carro."
+            try:
+                res = await bm.benchmark_core(self.poller.elm, self.poller.transport, self.poller.elm_info,
+                                              self.poller.supported, progress,
+                                              seconds=seconds or bm.SECONDS_PER_COMBO,
+                                              simulated=self.simulated, adapter_key=self.adapter_key)
+                rec = bm.tuning_record(res)
+                if rec is not None and res.tuning is not None:
+                    self.cfg.set_tuning(self.adapter_key, rec)
+                    self.cfg.save()
+                    self.poller.set_tuning(res.tuning)
+            finally:
+                self.poller.resume()
+            path = bm.save_report(res, self.logs_dir)
+            res.text += f"\nRelatório salvo em: {path}\n"
+            return res.text
+        finally:
+            self.benchmark_running = False
+
 
 # -----------------------------------------------------------------------------
 # Construção (real / simulado)
@@ -275,7 +389,8 @@ class Engine:
 def build_sim_engine(cfg: Config, scenario: str = "normal", time_factor: Optional[float] = None,
                      listener: Optional[Listener] = None, logs_dir: Optional[Path] = None,
                      latency: Optional[tuple] = None, search_delay: Optional[tuple] = None,
-                     seed: Optional[int] = None, faults=None, **kw) -> Engine:
+                     seed: Optional[int] = None, faults=None, profile: str = "bom",
+                     timing_model: bool = True, **kw) -> Engine:
     from .sim.fake_elm import SimAdapter, SimCar
     from .transport.simulated import make_sim_factory
     car = SimCar(scenario, time_factor=time_factor, seed=seed)
@@ -286,7 +401,8 @@ def build_sim_engine(cfg: Config, scenario: str = "normal", time_factor: Optiona
         akw["latency"] = latency
     if search_delay:
         akw["search_delay"] = search_delay
-    adapter = SimAdapter(car, **akw)
+    adapter = SimAdapter(car, profile=profile, timing_model=timing_model, **akw)
+    kw.setdefault("adapter_key", f"simulador:{profile}")
     return Engine(cfg, make_sim_factory(adapter), simulated=True, sim_car=car, sim_adapter=adapter,
                   listener=listener, logs_dir=logs_dir, **kw)
 
@@ -295,7 +411,7 @@ def build_ble_engine(cfg: Config, address: str, listener: Optional[Listener] = N
                      logs_dir: Optional[Path] = None, **kw) -> Engine:
     from .transport.ble import BleTransport
     return Engine(cfg, lambda: BleTransport(address), simulated=False, listener=listener,
-                  logs_dir=logs_dir, **kw)
+                  logs_dir=logs_dir, adapter_key=address, **kw)
 
 
 class AsyncRunner:

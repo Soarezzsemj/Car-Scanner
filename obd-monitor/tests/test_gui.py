@@ -136,3 +136,26 @@ def test_gui_normal_screenshot_and_selftest(app, window):
     QTest.qWait(2500)
     w.grab().save(str(IMG / "diagnostico.png"))
     assert "Ciclo rápido" in w.diag.report.toPlainText()
+
+    # taxa real (Hz) e idade de cada parâmetro no painel e na aba Diagnóstico
+    w.tabs.setCurrentIndex(0)
+    assert wait_until(app, lambda: "Hz" in w.freshness.text() and "RPM" in w.freshness.text(), 5)
+    assert "rodadas/s" in w.rate.text() or w._topbar_level >= 1
+    assert w.diag.fields["modo"].text().startswith("sufixo 1 ligado")
+    assert "escrita" in w.diag.fields["lat1"].text() or w.diag.fields["latm"].text() != "--"
+    assert w.diag.table.horizontalHeaderItem(4).text() == "Taxa (Hz)"
+
+    # benchmark pela aba Configurações (curto: 0,4 s por combinação)
+    w.tabs.setCurrentWidget(w.settings)
+    w.run_benchmark(seconds=0.4)
+    assert not w.settings.bench_btn.isEnabled()
+    assert wait_until(app, lambda: w.settings.bench_btn.isEnabled(), 120), "benchmark não terminou"
+    txt = w.diag.report.toPlainText()
+    assert "ESCOLHIDA" in txt and "Ganho: de " in txt, txt[-800:]
+    assert w.cfg.tuning_for("simulador:bom")["source"] == "benchmark"
+    assert "rodadas/s" in w.settings.tuning_lbl.text()
+    assert wait_until(app, lambda: w.link == "ok", 10)     # voltou a ler depois do benchmark
+    assert wait_until(app, lambda: w.engine.poller.active.source == "benchmark", 10)
+    w.tabs.setCurrentWidget(w.settings)
+    QTest.qWait(300)
+    w.grab().save(str(IMG / "configuracoes.png"))

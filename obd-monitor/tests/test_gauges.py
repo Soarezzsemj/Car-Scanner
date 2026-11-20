@@ -57,3 +57,15 @@ def test_real_screens_and_windows_scaling(screen, scale, tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert f"devicePixelRatio={float(scale)}" in r.stdout, r.stdout
     assert "0 problema(s)" in r.stdout
+
+
+def test_stale_value_is_yellow(app):
+    """Valor com idade > 1,5 s: número em amarelo (sem renderizar)."""
+    from obdmon.ui.gauges import ArcGauge, BarGauge
+    for g in (ArcGauge("RPM", "rpm", 0, 7000, []), BarGauge("Carga", "%", 0, 100, [])):
+        g.set_value(800)
+        assert g.value_color().name() == theme.TEXT.lower()
+        g.set_stale(True)
+        assert g.value_color().name() == theme.YELLOW.lower()
+        g.set_stale(False)
+        assert g.value_color().name() == theme.TEXT.lower()

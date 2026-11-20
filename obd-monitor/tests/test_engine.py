@@ -106,7 +106,7 @@ def test_intermitente_manual_mark(tmp_path):
     assert not any(c.startswith("DTC_NOVO") for c in codes(eng))
     rows = read_rows(eng.logger.csv_path)
     marked = [r for r in rows if "LUZ_OLEO_MANUAL" in r["evento"]]
-    assert len(marked) == 1 and marked[0]["nota"] == "teste"
+    assert len(marked) == 1 and marked[0]["nota"].startswith("teste / tecla S às ")
     assert any("LUZ_OLEO_MANUAL" in p.name for p in eng.logger.snapshot_paths)
     log = eng.logger.events_path.read_text(encoding="utf-8-sig")
     assert "LUZ DO ÓLEO ACENDEU" in log

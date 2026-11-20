@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +31,24 @@ class Config:
     logs_dir: str = ""              # vazio = <pasta do programa>/logs
     sim_scenario: str = "normal"
     sim_factor: float = 0.0         # 0 = padrão do cenário
+    optimize: bool = True           # otimizações de velocidade (sufixo, multi-PID...) com detecção automática
+    tuning: dict = field(default_factory=dict)   # endereço do adaptador -> resultado do benchmark
 
     @property
     def logs_path(self) -> Path:
         return Path(self.logs_dir) if self.logs_dir else APP_DIR / "logs"
+
+    def tuning_for(self, address: str) -> Optional[dict]:
+        t = self.tuning.get(address) if address else None
+        return dict(t) if isinstance(t, dict) else None
+
+    def set_tuning(self, address: str, data: Optional[dict]) -> None:
+        if not address:
+            return
+        if data is None:
+            self.tuning.pop(address, None)
+        else:
+            self.tuning[address] = dict(data)
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":

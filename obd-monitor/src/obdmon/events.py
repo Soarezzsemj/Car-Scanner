@@ -23,6 +23,7 @@ CONEXAO_RESTABELECIDA = "CONEXAO_RESTABELECIDA"
 PID_NAO_SUPORTADO = "PID_NAO_SUPORTADO"
 INICIO_VIAGEM = "INICIO_VIAGEM"
 FIM_VIAGEM = "FIM_VIAGEM"
+OTIMIZACAO_DESATIVADA = "OTIMIZACAO_DESATIVADA"
 
 
 @dataclass
@@ -86,6 +87,8 @@ class Event:
             return "Início da viagem"
         if k == FIM_VIAGEM:
             return "Fim da viagem"
+        if k == OTIMIZACAO_DESATIVADA:
+            return f"Otimização de velocidade desativada ({a})"
         return self.code
 
 
@@ -114,8 +117,12 @@ def values_summary(v: dict) -> str:
 
 
 def format_event_line(ev: Event) -> str:
-    """Linha do arquivo eventos_<viagem>.log."""
-    s = f"{ev.t_wall:%H:%M:%S}  {ev.label}"
+    """Linha do arquivo eventos_<viagem>.log. A tecla S sai com milissegundos
+    (hora do aperto, não do tique seguinte do log)."""
+    if ev.kind == LUZ_OLEO_MANUAL:
+        s = f"{ev.t_wall:%H:%M:%S}.{ev.t_wall.microsecond // 1000:03d}  {ev.label}"
+    else:
+        s = f"{ev.t_wall:%H:%M:%S}  {ev.label}"
     if ev.detail:
         s += f" ({ev.detail})"
     return s + " | " + values_summary(ev.values)

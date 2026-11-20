@@ -16,13 +16,28 @@ class SimulatedTransport(Transport):
     name = "Simulador"
     is_simulated = True
 
-    def __init__(self, adapter: SimAdapter) -> None:
+    def __init__(self, adapter: SimAdapter, write_with_response: Optional[bool] = None) -> None:
+        """Como o BLE real: tem escrita com e sem resposta; o padrão
+        (None) é SEM resposta, igual ao BleTransport."""
         super().__init__()
         self.adapter = adapter
         self._connected = False
         self._rxbuf = ""
         self._tasks: set[asyncio.Task] = set()
         self._gen = 0  # invalida respostas pendentes de uma conexão anterior
+        self._with_response = bool(write_with_response)
+
+    @property
+    def write_modes(self) -> tuple[bool, ...]:
+        return (True, False)
+
+    @property
+    def write_with_response(self) -> Optional[bool]:
+        return self._with_response
+
+    def set_write_with_response(self, with_response: bool) -> bool:
+        self._with_response = bool(with_response)
+        return True
 
     async def connect(self) -> None:
         await asyncio.sleep(0.05)
@@ -45,7 +60,11 @@ class SimulatedTransport(Transport):
         safety.check_raw_bytes(data)  # mesma barreira do BLE real
         if not self._connected:
             raise TransportError("Não conectado")
-        await asyncio.sleep(0)
+        if self._with_response:
+            # escrita com confirmação: espera o "ack" do próximo evento de conexão
+            await asyncio.sleep(self.adapter.rng.uniform(*self.adapter.write_ack))
+        else:
+            await asyncio.sleep(0)
         self._rxbuf += data.decode("ascii")
         while "\r" in self._rxbuf:
             cmd, self._rxbuf = self._rxbuf.split("\r", 1)
@@ -55,21 +74,26 @@ class SimulatedTransport(Transport):
 
     async def _respond(self, cmd: str, gen: int) -> None:
         ad = self.adapter
-        text, extra = ad.elm.handle(cmd)
+        parts = ad.elm.handle_parts(cmd)
         if ad.stalled():
             return  # travada silenciosa: o comando "some"
-        await asyncio.sleep(ad.rng.uniform(*ad.latency) + extra)
-        if ad.faults.truncate and ad.rng.random() < ad.faults.truncate and len(text) > 6:
-            cut = ad.rng.randint(2, len(text) - 3)
-            text = text[:cut] + "\r>"
+        if ad.faults.truncate and ad.rng.random() < ad.faults.truncate:
+            text = "".join(t for t, _ in parts)
+            if len(text) > 6:
+                cut = ad.rng.randint(2, len(text) - 3)
+                parts = [(text[:cut] + "\r>", sum(d for _, d in parts))]
+        await asyncio.sleep(ad.rng.uniform(*ad.latency))   # rádio BLE
         n = ad.chunk_size
-        for i in range(0, len(text), n):
-            if gen != self._gen or not self._connected:
-                return
-            if ad.faults.packet_loss and ad.rng.random() < ad.faults.packet_loss:
-                continue
-            self._emit_data(text[i:i + n].encode("ascii"))
-            await asyncio.sleep(ad.rng.uniform(*ad.chunk_gap))
+        for text, delay in parts:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            for i in range(0, len(text), n):
+                if gen != self._gen or not self._connected:
+                    return
+                if ad.faults.packet_loss and ad.rng.random() < ad.faults.packet_loss:
+                    continue
+                self._emit_data(text[i:i + n].encode("ascii"))
+                await asyncio.sleep(ad.rng.uniform(*ad.chunk_gap))
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -83,11 +107,17 @@ class SimulatedTransport(Transport):
         return self._connected
 
     def describe(self) -> dict:
-        return {"transporte": "Simulador (ELM327 falso)", "cenario": self.adapter.car.scenario.name}
+        return {"transporte": "Simulador (ELM327 falso)", "cenario": self.adapter.car.scenario.name,
+                "perfil_adaptador": self.adapter.profile,
+                "escrita_com_resposta": "sim" if self._with_response else "não",
+                "modos_de_escrita": "com resposta, sem resposta"}
 
 
-def make_sim_factory(adapter: SimAdapter):
-    return lambda: SimulatedTransport(adapter)
+def make_sim_factory(adapter: SimAdapter, write_with_response_ref=None):
+    """``write_with_response_ref``: função que devolve o modo de escrita
+    desejado (lido a cada reconexão, como o BleTransport)."""
+    ref = write_with_response_ref or (lambda: None)
+    return lambda: SimulatedTransport(adapter, ref())
 
 
 __all__ = ["SimulatedTransport", "make_sim_factory", "Optional"]

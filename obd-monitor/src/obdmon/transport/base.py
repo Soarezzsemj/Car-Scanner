@@ -59,3 +59,17 @@ class Transport(ABC):
     def describe(self) -> dict:
         """Informações para a aba Diagnóstico."""
         return {"transporte": self.name}
+
+    # -- modo de escrita (BLE: com ou sem confirmação) --------------------------
+    @property
+    def write_modes(self) -> tuple[bool, ...]:
+        """Modos de escrita disponíveis: True = com resposta, False = sem resposta."""
+        return ()
+
+    @property
+    def write_with_response(self) -> Optional[bool]:
+        return None
+
+    def set_write_with_response(self, with_response: bool) -> bool:
+        """Troca o modo de escrita; False se este transporte não tiver esse modo."""
+        return False

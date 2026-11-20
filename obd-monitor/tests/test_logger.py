@@ -86,7 +86,7 @@ def test_snapshot_60s_before_30s_after(tmp_path):
     assert any("LUZ_OLEO_MANUAL" in r[COLUMNS.index("evento")] for r in rows)
     # log de texto legível
     txt = lg.events_path.read_text(encoding="utf-8-sig")
-    assert "10:01:40  LUZ DO ÓLEO ACENDEU | arrefecimento 104 °C" in txt
+    assert "10:01:40.000  LUZ DO ÓLEO ACENDEU | arrefecimento 104 °C" in txt   # tecla S com ms
 
 
 def test_non_critical_alert_has_no_snapshot(tmp_path):

@@ -90,11 +90,15 @@ def _num(v, d=0, unit=""):
 
 class MainWindow(QMainWindow):
     def __init__(self, cfg: Config, runner: AsyncRunner, simulated: bool, scenario: str = "normal",
-                 factor: Optional[float] = None, address: str = "", autostart: bool = True) -> None:
+                 factor: Optional[float] = None, address: str = "", autostart: bool = True,
+                 profile: str = "bom") -> None:
         super().__init__()
         self.cfg = cfg
         self.runner = runner
         self.simulated = simulated
+        self.profile = profile
+        self.last_ages: dict = {}
+        self._unsupported: set = set()
         self.scenario = scenario
         self.factor = factor
         self.cli_address = address
@@ -184,9 +188,10 @@ class MainWindow(QMainWindow):
         self.diag.logs_dir = self.cfg.logs_path
         self.diag.selftest_requested.connect(self.run_selftest)
         self.tabs.addTab(self.diag, "  Diagnóstico do adaptador  ")
-        self.settings = SettingsPage(self.cfg)
+        self.settings = SettingsPage(self.cfg, adapter_key=self._adapter_key)
         self.settings.saved.connect(self.apply_settings)
         self.settings.scan_requested.connect(self._scan_from_settings)
+        self.settings.benchmark_requested.connect(self.run_benchmark)
         self.tabs.addTab(self.settings, "  Configurações  ")
         self.stack.addWidget(self._build_trip_mode())
         self._set_link_badge(self.link)   # o badge do modo viagem nasce vazio
@@ -309,6 +314,14 @@ class MainWindow(QMainWindow):
             row.addWidget(b)
         left.addLayout(row)
 
+        # taxa real (Hz) e idade do dado de cada parâmetro rápido
+        self.freshness = QLabel("")
+        self.freshness.setObjectName("muted")
+        self.freshness.setTextFormat(Qt.TextFormat.RichText)
+        self.freshness.setToolTip("Leituras por segundo de cada parâmetro (últimos 5 s) e idade do último "
+                                  "valor válido. Em amarelo: valor com mais de 1,5 s.")
+        left.addWidget(self.freshness)
+
         card = QFrame()
         card.setObjectName("card")
         cl = QVBoxLayout(card)
@@ -429,6 +442,10 @@ class MainWindow(QMainWindow):
     def _address(self) -> str:
         return self.cli_address or self.cfg.preferred_address or self.cfg.last_address
 
+    def _adapter_key(self) -> str:
+        """Chave das otimizações salvas no config.json (endereço do adaptador)."""
+        return f"simulador:{self.profile}" if self.simulated else self._address()
+
     def start_engine(self, scenario: Optional[str] = None, factor: Optional[float] = None) -> None:
         if self.engine is not None and self.engine.running:
             return
@@ -436,7 +453,8 @@ class MainWindow(QMainWindow):
             scenario = scenario or self.scenario
             factor = factor if factor is not None else self.factor
             self.scenario, self.factor = scenario, factor
-            self.engine = build_sim_engine(self.cfg, scenario, time_factor=factor, listener=self._listener)
+            self.engine = build_sim_engine(self.cfg, scenario, time_factor=factor, listener=self._listener,
+                                           profile=self.profile)
             self.sim_panel.attach(self.engine.sim_car, self.engine.sim_adapter)
         else:
             addr = self._address()
@@ -512,20 +530,46 @@ class MainWindow(QMainWindow):
         self.file_label.setText(f"Gravando: {Path(p['csv']).name}")
         self.status.showMessage(f"Nova viagem – log em {p['csv']}", 8000)
 
-    def _on_live(self, values: dict) -> None:
-        self._set_values(values)
+    def _on_live(self, p: dict) -> None:
+        self._set_values(p["values"], p.get("ages"))
 
-    def _set_values(self, values: dict) -> None:
+    def _set_values(self, values: dict, ages: Optional[dict] = None) -> None:
+        from ..engine import STALE_S
         self.last_values = values
+        ages = ages or {}
+        self.last_ages = ages
+
+        def stale(k):
+            a = ages.get(k)
+            return a is not None and a > STALE_S
         for k, g in self.gauges.items():
             g.set_value(values.get(k))
+            g.set_stale(stale(k))
             self.trip_gauges[k].set_value(values.get(k))
+            self.trip_gauges[k].set_stale(stale(k))
         for k, b in self.bars.items():
             b.set_value(values.get(k))
+            b.set_stale(stale(k))
+
+    def _update_freshness(self, hz: dict, ages: dict) -> None:
+        from ..engine import STALE_S
+        from ..pids import BY_KEY, FAST_CORE_KEYS
+        parts = []
+        for k in FAST_CORE_KEYS + ("admissao_c",):
+            if k not in BY_KEY or k in self._unsupported:
+                continue
+            a = ages.get(k)
+            col = theme.YELLOW if (a is None or a > STALE_S) else theme.MUTED
+            age_txt = "--" if a is None else f"{a:.1f} s".replace(".", ",")
+            parts.append(f"<span style='color:{col}'>{BY_KEY[k].name.replace('Temp. ', '')} "
+                         f"<b>{_num(hz.get(k), 1)} Hz</b> · {age_txt}</span>")
+        self.freshness.setText("  |  ".join(parts))
 
     def _on_tick(self, p) -> None:
         row = p["row"]
-        self._set_values(row["values"])
+        self._unsupported = set(p["unsupported"])
+        self._set_values(p.get("display", row["values"]), p.get("ages"))
+        self._update_freshness(p.get("hz_by_key", {}), p.get("ages", {}))
         self.chart.add_row(row["t_s"], row["values"])
         self.chart.tick()
         unsupported = set(p["unsupported"])
@@ -541,7 +585,7 @@ class MainWindow(QMainWindow):
         self._update_alert_banner()
         hz = p["hz"] or 0
         lat = p["latency_ms"]
-        self._rate_full = f"{_num(hz, 1)} Hz · {_num(lat, 0)} ms/consulta"
+        self._rate_full = f"{_num(hz, 1)} rodadas/s · {_num(lat, 0)} ms/consulta"
         self.rate.setText(self._rate_full if self._topbar_level < 1 else f"{_num(hz, 1)} Hz")
         if self.trip_start is not None:
             el = int(row["t_s"])
@@ -554,7 +598,8 @@ class MainWindow(QMainWindow):
             values_summary(e.values).replace(" | ", "\n")
         if e.kind != ev.INICIO_VIAGEM:
             self.events_panel.add(e)
-        if e.kind in (ev.INICIO_VIAGEM, ev.FIM_VIAGEM, ev.PID_NAO_SUPORTADO, ev.DTC_APAGADO):
+        if e.kind in (ev.INICIO_VIAGEM, ev.FIM_VIAGEM, ev.PID_NAO_SUPORTADO, ev.DTC_APAGADO,
+                      ev.OTIMIZACAO_DESATIVADA):
             return  # só na lista, sem marcador no gráfico
         self.chart.add_event(e, tip)
         if e.kind == ev.CONEXAO_PERDIDA:
@@ -660,6 +705,11 @@ class MainWindow(QMainWindow):
         if detail:
             self.status.showMessage(detail, 10000)
 
+    def _on_notice(self, msg) -> None:
+        """Aviso do poller (ex.: otimização desativada por dado errado)."""
+        self.status.showMessage("⚠ " + msg, 30000)
+        self.diag.add_notice(msg)
+
     def _on_log_error(self, msg) -> None:
         self.status.showMessage("ERRO NO LOG: " + msg, 30000)
         self.conn_banner.setText("⚠  ERRO AO GRAVAR O LOG: " + msg + "  (disco cheio?)")
@@ -690,21 +740,30 @@ class MainWindow(QMainWindow):
         self.diag.set_running(False)
         self.diag.set_report(text or "Autoteste não pôde ser executado.")
 
+    def _on_benchmark_done(self, text) -> None:
+        self.diag.set_running(False)
+        self.settings.set_benchmark_running(False)
+        self.diag.set_report(text or "Benchmark não pôde ser executado.")
+        self.settings.load()
+
     # --------------------------------------------------------------- ações
     def mark_oil_light(self) -> None:
-        now = time.monotonic()
-        if now - self.last_mark_ui < 1.0:
+        # instante EXATO do aperto (monotonic + hora), antes de qualquer outra coisa
+        at = time.monotonic()
+        at_wall = datetime.now()
+        if at - self.last_mark_ui < 1.0:
             return
-        self.last_mark_ui = now
+        self.last_mark_ui = at
         v = self.last_values
         if self.engine is None or not self.engine.running:
             self.mark_info.setText("⚠ Não está gravando: conecte ao carro primeiro.")
             self.mark_info.setStyleSheet(f"color:{theme.YELLOW}; font-weight: 700;")
             return
-        self.runner.call(self.engine.mark_oil_light, "")
+        self.runner.call(self.engine.mark_oil_light, "", at)
         self.marks += 1
         sound.beep("mark")
-        msg = (f"✔ Marcado às {datetime.now():%H:%M:%S} — arrefecimento {_num(v.get('arrefecimento_c'))} °C · "
+        msg = (f"✔ Marcado às {at_wall:%H:%M:%S}.{at_wall.microsecond // 1000:03d} — "
+               f"arrefecimento {_num(v.get('arrefecimento_c'))} °C · "
                f"RPM {_num(v.get('rpm'))} · {_num(v.get('velocidade_kmh'))} km/h  (marcação nº {self.marks})")
         for lbl in (self.mark_info, self.trip_mark):
             lbl.setText(msg)
@@ -765,6 +824,26 @@ class MainWindow(QMainWindow):
                 bridge.message.emit("selftest_done", f.result())
             except Exception as e:
                 bridge.message.emit("selftest_done", f"Erro no autoteste: {e!r}")
+        fut.add_done_callback(done)
+
+    def run_benchmark(self, seconds: Optional[float] = None) -> None:
+        """Refaz o benchmark de velocidade (Configurações → Refazer benchmark)."""
+        if self.engine is None or not self.engine.running or self.link not in (LINK_OK, LINK_UNSTABLE):
+            QMessageBox.information(self, "Benchmark", "Conecte ao carro primeiro (carro PARADO, motor ligado).")
+            return
+        self.diag.set_running(True)
+        self.settings.set_benchmark_running(True)
+        self.diag.set_report("BENCHMARK DE VELOCIDADE (carro parado, motor ligado) – leva ~2 a 3 minutos\n")
+        self.tabs.setCurrentWidget(self.diag)
+        bridge = self.bridge
+        fut = self.runner.submit(self.engine.run_benchmark(
+            lambda s: bridge.message.emit("selftest_progress", s), seconds))
+
+        def done(f):
+            try:
+                bridge.message.emit("benchmark_done", f.result())
+            except Exception as e:
+                bridge.message.emit("benchmark_done", f"Erro no benchmark: {e!r}")
         fut.add_done_callback(done)
 
     # ------------------------------------------------------------- timers
